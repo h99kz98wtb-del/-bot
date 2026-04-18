@@ -1,0 +1,130 @@
+import os
+import discord
+from discord.ext import commands
+from discord.ui import Button, View
+
+# 環境変数からトークンとチャンネルIDを読み込む
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+GUILD_ID = int(os.getenv('DISCORD_GUILD_ID')) # サーバーID
+ADMIN_CHANNEL_ID = int(os.getenv('DISCORD_ADMIN_CHANNEL_ID')) # 管理者通知用チャンネルID
+CATEGORY_ID = int(os.getenv('DISCORD_TICKET_CATEGORY_ID')) # チケットチャンネル作成用カテゴリID
+
+# 商品リスト（仮）
+# 実際にはデータベースや外部ファイルから読み込むことを推奨
+PRODUCTS = {
+    "item1": {"name": "おいしいジュース", "price": 150, "description": "喉を潤す定番ドリンク"},
+    "item2": {"name": "特製お菓子", "price": 200, "description": "小腹が空いた時にぴったり"},
+    "item3": {"name": "謎のアイテム", "price": 500, "description": "何が出るかはお楽しみ！"},
+}
+
+intents = discord.Intents.default()
+intents.message_content = True # メッセージ内容の読み取りを許可
+intents.members = True # メンバー情報の読み取りを許可
+
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+    # コマンドを登録（初回起動時やコマンド変更時に実行）
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f'Synced commands for guild {GUILD_ID}')
+
+class PurchaseButton(View):
+    def __init__(self):
+        super().__init__(timeout=None) # タイムアウトなし
+
+    @discord.ui.button(label="購入手続きへ", style=discord.ButtonStyle.green, custom_id="purchase_button")
+    async def purchase_callback(self, interaction: discord.Interaction, button: Button):
+        user = interaction.user
+        guild = interaction.guild
+
+        # 既にチケットチャンネルが存在するかチェック
+        for channel in guild.channels:
+            if channel.name == f'ticket-{user.name.lower()}':
+                await interaction.response.send_message(f"既に購入手続き中のチャンネルがあります: {channel.mention}", ephemeral=True)
+                return
+
+        # チケットチャンネルを作成
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True)
+        }
+        category = discord.utils.get(guild.categories, id=CATEGORY_ID)
+        if not category:
+            await interaction.response.send_message("チケット用カテゴリが見つかりません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        ticket_channel = await guild.create_text_channel(
+            name=f'ticket-{user.name}',
+            category=category,
+            overwrites=overwrites
+        )
+
+        await ticket_channel.send(
+            f"{user.mention}さん、購入手続きを開始します。\n" +
+            "ご希望の商品とPayPayの送金リンクをこちらに送信してください。\n" +
+            "管理者が確認後、対応いたします。\n" +
+            "取引が完了したら、下の「取引完了」ボタンを押してください。"
+        )
+
+        # 取引完了ボタンを設置
+        close_view = CloseTicketButton()
+        await ticket_channel.send(view=close_view)
+
+        await interaction.response.send_message(f"購入手続き用のチャンネルを作成しました: {ticket_channel.mention}", ephemeral=True)
+
+        # 管理者チャンネルに通知
+        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        if admin_channel:
+            await admin_channel.send(f"新しい購入チケットが作成されました: {ticket_channel.mention} by {user.mention}")
+
+class CloseTicketButton(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="取引完了（チャンネル削除）", style=discord.ButtonStyle.red, custom_id="close_ticket_button")
+    async def close_callback(self, interaction: discord.Interaction, button: Button):
+        # チャンネルを削除する権限があるか確認（管理者またはチャンネル作成者）
+        if interaction.user.guild_permissions.manage_channels or interaction.channel.name == f'ticket-{interaction.user.name.lower()}':
+            await interaction.response.send_message("チャンネルを削除します。", ephemeral=False)
+            await interaction.channel.delete(reason="取引完了")
+            admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+            if admin_channel:
+                await admin_channel.send(f"チケットチャンネル {interaction.channel.name} が {interaction.user.mention} によって閉じられました。")
+        else:
+            await interaction.response.send_message("このチャンネルを削除する権限がありません。", ephemeral=True)
+
+@bot.tree.command(name="panel", description="商品パネルを表示します", guild=discord.Object(id=GUILD_ID))
+@commands.has_permissions(manage_channels=True) # チャンネル管理権限を持つユーザーのみ実行可能
+async def show_panel(interaction: discord.Interaction):
+    embed = discord.Embed(title="自販機Bot - 商品一覧", description="購入したい商品を選んでください！", color=discord.Color.blue())
+
+    for key, product in PRODUCTS.items():
+        embed.add_field(name=f"{product['name']} - {product['price']}円", value=product['description'], inline=False)
+
+    view = PurchaseButton()
+    await interaction.response.send_message(embed=embed, view=view)
+
+@show_panel.error
+async def show_panel_error(interaction: discord.Interaction, error):
+    if isinstance(error, commands.MissingPermissions):
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+# Botの実行
+if __name__ == '__main__':
+    if not TOKEN:
+        print("環境変数 'DISCORD_BOT_TOKEN' が設定されていません。")
+    if not GUILD_ID:
+        print("環境変数 'DISCORD_GUILD_ID' が設定されていません。")
+    if not ADMIN_CHANNEL_ID:
+        print("環境変数 'DISCORD_ADMIN_CHANNEL_ID' が設定されていません。")
+    if not CATEGORY_ID:
+        print("環境変数 'DISCORD_TICKET_CATEGORY_ID' が設定されていません。")
+    if TOKEN and GUILD_ID and ADMIN_CHANNEL_ID and CATEGORY_ID:
+        bot.run(TOKEN)
+    else:
+        print("必要な環境変数が不足しているため、Botを起動できません。")
